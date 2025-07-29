@@ -1,0 +1,1 @@
+need zadig to replace driver on the usbb FT232H
