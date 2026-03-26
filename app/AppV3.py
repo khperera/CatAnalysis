@@ -4,10 +4,8 @@ import numpy as np
 import time
 import queue
 import threading
-from collections import Counter
 
 import app.cat_inference as cat_inference
-import app.StateTracker as State
 
 # YOLO runs at this width; frames are pre-shrunk before inference
 _YOLO_WIDTH = 640
