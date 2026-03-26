@@ -2,52 +2,72 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 import time
-import numpy as np
+import queue
+import threading
 from collections import Counter
 
 import app.cat_inference as cat_inference
-import threading
 import app.StateTracker as State
+
+# YOLO runs at this width; frames are pre-shrunk before inference
+_YOLO_WIDTH = 640
 
 
 class Processor:
     def __init__(self):
-        # Load the segmentation model directly without exporting to NCNN
-        # Using the original PyTorch model which fully supports segmentation
         self.model = YOLO("yolo11m-seg.pt")
-        self.current_frame = None
-        self.RunningYolo = False
-        
-        # basically, how often frames before we run yolo.
-        self.YOLOlimit = 6
-        self.YOLOCounter = 0
-        
-
-
         self.results = None
-
 
         self.focusedmodel = cat_inference.CatInference("./cat_classifier_mobilenet_v3.pth")
 
         self.bunt_counter = 0
-        # self.bunt_names = ["stinky", "dirty motherfucker", "bingo boy"]
-        self.bunt_names = ["stinky", "dirty motherfucker", "bingo boy", "evil guy doing evil things", "suck guy", 
-                   "cheese bandit", "sock thief", "chaos goblin", "menace to society", "garbage wizard", 
-                   "criminal mastermind", "bologna destroyer", "couch assassin", "tuna terrorist", 
-                   "box infiltrator", "midnight marauder", "cable murderer", "keyboard walker", 
-                   "curtain climber", "treat slurper", "sleep destroyer", 
-                   "3am sucker","3am sucker"]
-        #counter 
-        self.bunt_namecountover= 60
-        self.bunt_max = len(self.bunt_names)-1
+        self.bunt_names = ["stinky", "dirty motherfucker", "bingo boy", "evil guy doing evil things", "suck guy",
+                   "cheese bandit", "sock thief", "chaos goblin", "menace to society", "garbage wizard",
+                   "criminal mastermind", "bologna destroyer", "couch assassin", "tuna terrorist",
+                   "box infiltrator", "midnight marauder", "cable murderer", "keyboard walker",
+                   "curtain climber", "treat slurper", "sleep destroyer",
+                   "3am sucker", "3am sucker"]
+        self.bunt_namecountover = 60
+        self.bunt_max = len(self.bunt_names) - 1
 
-        # Note: We're not exporting to NCNN format since it may not fully
-        # support the segmentation prototype layers in the same way
+        # Zoom inset state: cycles through detected cats one at a time
+        self.zoom_index = 0
+        self.zoom_last_switch = time.time()
+        self.zoom_interval = 5.0  # seconds between switching to next cat
+
+        # Persistent background YOLO worker — avoids thread spawn overhead per frame.
+        # maxsize=1 means we keep only the latest frame; stale ones are dropped.
+        self._yolo_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._yolo_thread = threading.Thread(target=self._yolo_worker, daemon=True)
+        self._yolo_thread.start()
+
+        # Time-based throttle: submit a new frame to YOLO at most every N seconds
+        self.yolo_interval = 0.15  # ~6-7 FPS inference cap
+        self._last_yolo_submit = 0.0
 
    
 
   
     
+    def _yolo_worker(self):
+        """Persistent daemon thread — pulls frames from queue and runs YOLO."""
+        while True:
+            frame = self._yolo_queue.get()
+            self.results = self.model(frame, task="segment", verbose=False)
+
+    def _submit_to_yolo(self, frame):
+        """Resize frame to YOLO native width, then enqueue (drop stale frame if busy)."""
+        h, w = frame.shape[:2]
+        if w > _YOLO_WIDTH:
+            scale = _YOLO_WIDTH / w
+            frame = cv2.resize(frame, (_YOLO_WIDTH, int(h * scale)), interpolation=cv2.INTER_LINEAR)
+        # Drop any unprocessed frame so the worker always gets the freshest one
+        try:
+            self._yolo_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._yolo_queue.put(frame)
+
     def process_mask(self, mask, imglocation, savename):
         # Read the image  
         img = cv2.imread(imglocation)
@@ -65,25 +85,12 @@ class Processor:
         cv2.imwrite(savename, masked_img)
 
 
-    def process_yolo_segment(self):
-        if(self.RunningYolo):
-            return
-        self.RunningYolo = True
-        self.results = self.model(self.current_frame, task="segment", verbose=False)
-        self.RunningYolo = False
-
-    def get_bunt_name(self):
-        pass
-
-        
     def process_frame_cv(self, frame):
         try:
-            self.YOLOCounter += 1
-            self.current_frame = frame
-            if(self.results is None or self.YOLOCounter%self.YOLOlimit == 0  ):
-            # Run inference with the PyTorch model
-                thread = threading.Thread(target=self.process_yolo_segment)
-                thread.start()
+            now = time.time()
+            if self.results is None or (now - self._last_yolo_submit) >= self.yolo_interval:
+                self._submit_to_yolo(frame)
+                self._last_yolo_submit = now
             
             # # Get the annotated image from YOLO
             # annotated_image = results[0].plot()
@@ -96,6 +103,7 @@ class Processor:
             
             r = self.results[0]
             detected_cats = []
+            cat_crops = []  # [(cropped_frame, name, confidence_pct, det_conf)]
             # Process both boxes and masks
             if hasattr(r, 'boxes') and hasattr(r, 'masks') and r.masks is not None:
                 for i, (box, mask) in enumerate(zip(r.boxes, r.masks)):
@@ -142,7 +150,7 @@ class Processor:
                         x2 = min(width, int(xyxy[2]))
                         y2 = min(height, int(xyxy[3]))
 
-                        # Crop the frame
+                        # Crop the frame (from original, no overlays)
                         cropped_frame = frame[y1:y2, x1:x2]
 
                         focusedout = self.focusedmodel.predict_frame_CV(cropped_frame,True)
@@ -158,7 +166,8 @@ class Processor:
                                 name = "bunt"
                                 confidence = focusedout["confidence_percent"]
                         
-                        detected_cats.insert(name)
+                        detected_cats.append(name)
+                        cat_crops.append((cropped_frame.copy(), name, confidence, conf))
                         if(name == "bunt"):
                             self.bunt_counter += 1
                             index = self.bunt_counter/self.bunt_namecountover
@@ -201,6 +210,62 @@ class Processor:
                         
                        
             
+            # Draw zoomed inset of one cat at a time, switching occasionally
+            if cat_crops:
+                now = time.time()
+                n = len(cat_crops)
+                if n > 1 and (now - self.zoom_last_switch) >= self.zoom_interval:
+                    self.zoom_index = (self.zoom_index + 1) % n
+                    self.zoom_last_switch = now
+                if self.zoom_index >= n:
+                    self.zoom_index = 0
+
+                zoom_crop, zoom_name, zoom_conf_pct, zoom_det_conf = cat_crops[self.zoom_index]
+
+                if zoom_crop is not None and zoom_crop.size > 0:
+                    fh, fw = custom_frame.shape[:2]
+                    max_w, max_h = 300, 240
+                    ch, cw = zoom_crop.shape[:2]
+                    if cw > 0 and ch > 0:
+                        scale = min(max_w / cw, max_h / ch)
+                        inset_w = int(cw * scale)
+                        inset_h = int(ch * scale)
+                        zoom_resized = cv2.resize(zoom_crop, (inset_w, inset_h))
+
+                        header_h = 26
+                        footer_h = 26
+                        panel_h = inset_h + header_h + footer_h
+                        panel_w = inset_w
+                        pad = 10
+                        border = 3
+                        px = fw - panel_w - pad - border
+                        py = fh - panel_h - pad - border
+
+                        # White border around the whole panel
+                        cv2.rectangle(custom_frame,
+                                      (px - border, py - border),
+                                      (px + panel_w + border, py + panel_h + border),
+                                      (255, 255, 255), border)
+
+                        # Header bar
+                        cv2.rectangle(custom_frame, (px, py),
+                                      (px + panel_w, py + header_h), (30, 30, 180), -1)
+                        indicator = f"ZOOM [{self.zoom_index + 1}/{n}]  {zoom_name}"
+                        cv2.putText(custom_frame, indicator, (px + 5, py + 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                        # Cat image
+                        img_y = py + header_h
+                        custom_frame[img_y:img_y + inset_h, px:px + inset_w] = zoom_resized
+
+                        # Footer bar
+                        footer_y = img_y + inset_h
+                        cv2.rectangle(custom_frame, (px, footer_y),
+                                      (px + panel_w, footer_y + footer_h), (30, 30, 180), -1)
+                        conf_text = f"Confidence: {zoom_conf_pct}"
+                        cv2.putText(custom_frame, conf_text, (px + 5, footer_y + 18),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
             # Return the custom processed frame instead of the default annotated image
             return custom_frame, detected_cats
             
